@@ -3,6 +3,7 @@
   "symbols": {
     "نمادساختگی": {
       "published_at": "2000-01-01",
+      "valuation_date": "2000-01-01",
       "period_end": "1999-12-01",
       "source_url": "https://www.codal.ir/",
       "comparable_yoy": true,

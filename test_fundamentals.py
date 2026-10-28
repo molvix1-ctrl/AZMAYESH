@@ -11,6 +11,7 @@ from fundamentals import assess, combine
 
 def statement(today):
     return dict(published_at=(today-timedelta(days=10)).isoformat(),
+                valuation_date=today.isoformat(),
                 period_end=(today-timedelta(days=40)).isoformat(),
                 source_url='https://www.codal.ir/Reports/example', comparable_yoy=True,
                 revenue=120, revenue_yoy=100, net_profit=15, net_profit_yoy=10,
@@ -34,6 +35,7 @@ class FundamentalTests(unittest.TestCase):
         changes = ({'published_at': '2000-01-01'},
                    {'published_at': (self.today+timedelta(days=1)).isoformat()},
                    {'source_url': 'https://evil.test/report'}, {'comparable_yoy': False},
+                   {'valuation_date': '2000-01-01'}, {'source_url': 'https://www.codal.ir/'},
                    {'eps_ttm': float('nan')}, {'equity': 0}, {'net_profit_yoy': -1})
         for change in changes:
             with self.subTest(change=change):

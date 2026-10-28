@@ -49,6 +49,10 @@ def market_watch():
     rows = data.get('marketwatch') if isinstance(data, dict) else None
     if not isinstance(rows, list):
         raise DataError('قالب دیده‌بان TSETMC شناخته نشد؛ اتصال نیاز به تطبیق دارد.')
+    required = {'insCode', 'lVal18AFC', 'dEven', 'hEven', 'pClosing', 'pDrCotVal',
+                'qTotTran5J', 'qTotCap', 'pMeDem', 'pMeOf', 'qTitMeDem', 'qTitMeOf'}
+    if rows and not any(isinstance(row, dict) and required <= row.keys() for row in rows):
+        raise DataError('پاسخ TSETMC فیلدهای لازم قیمت/سفارش را ندارد؛ مبدل API باید با پاسخ واقعی تطبیق داده شود.')
     return rows
 
 
@@ -57,33 +61,41 @@ def daily_history(ins_code):
     rows = data.get('closingPriceDaily') if isinstance(data, dict) else None
     if not isinstance(rows, list):
         raise DataError('قالب سابقهٔ TSETMC شناخته نشد.')
+    required = {'dEven', 'pClosing', 'qTotTran5J', 'qTotCap'}
+    if rows and not all(isinstance(row, dict) and required <= row.keys() for row in rows):
+        raise DataError('قالب ردیف‌های سابقهٔ TSETMC معتبر نیست.')
     return rows
 
 
-def fresh(row, now):
+def fresh(row, now, mode='live'):
     """Only accept snapshots within ten minutes, never replay yesterday's picks."""
     try:
         stamp = datetime.strptime(str(int(row['dEven'])) + f"{int(row['hEven']):06}",
                                   '%Y%m%d%H%M%S').replace(tzinfo=TEHRAN)
-        return 0 <= (now - stamp).total_seconds() <= 600
+        limit = 7 * 86400 if mode == 'latest' else 600
+        return 0 <= (now - stamp).total_seconds() <= limit
     except (KeyError, ValueError, TypeError):
         return False
 
 
-def evaluate(row, history, now):
+def evaluate(row, history, now, mode='live'):
     """Heuristic screen, not an expected-return or probability model."""
-    if not fresh(row, now):
+    if not fresh(row, now, mode):
         return None
     try:
-        today = int(now.strftime('%Y%m%d'))
+        # Historical features must precede the QUOTE session, not the request day.
+        today = int(row['dEven'])
+        session = datetime.strptime(str(today), '%Y%m%d').date()
         by_date = {int(h['dEven']): h for h in history if int(h['dEven']) < today
                    and float(h['pClosing']) > 0 and float(h['qTotTran5J']) > 0}
         past = [by_date[d] for d in sorted(by_date)][-21:]
         if len(past) < 21:
             return None
-        if (now.date() - datetime.strptime(str(int(past[-1]['dEven'])), '%Y%m%d').date()).days > 7:
+        if (session - datetime.strptime(str(int(past[-1]['dEven'])), '%Y%m%d').date()).days > 7:
             return None
         prices = [float(h['pClosing']) for h in past]
+        if not all(math.isfinite(p) and p > 0 for p in prices):
+            return None
         returns = [b / a - 1 for a, b in zip(prices, prices[1:])]
         # Unadjusted corporate actions can look like trading opportunities.
         if any(abs(r) > .15 for r in returns):
@@ -98,7 +110,8 @@ def evaluate(row, history, now):
             return None
         # Require two-sided executable quotes. Skip locked queues / invalid quotes.
         bid, ask = float(row['pMeDem']), float(row['pMeOf'])
-        if not (0 < bid <= ask and float(row['qTitMeDem']) > 0 and float(row['qTitMeOf']) > 0):
+        if not (all(math.isfinite(v) for v in (bid, ask)) and
+                0 < bid <= ask and float(row['qTitMeDem']) > 0 and float(row['qTitMeOf']) > 0):
             return None
         spread = (ask - bid) / ((ask + bid) / 2)
         if spread > .01:
@@ -123,14 +136,19 @@ def evaluate(row, history, now):
         return dict(symbol=normalize(row['lVal18AFC']), category=category, score=score,
                     momentum=momentum, volatility=volatility, volume_ratio=volume_ratio,
                     spread=spread, value=value, last=last, timestamp=int(row['hEven']),
-                    date=int(row['dEven']), ma20=statistics.mean(prices[-20:]))
+                    date=int(row['dEven']), ma20=statistics.mean(prices[-20:]), report_mode=mode)
     except (KeyError, ValueError, TypeError, statistics.StatisticsError, OverflowError):
         return None
 
 
-def scan(rows, history_loader, now=None):
+def scan(rows, history_loader, now=None, mode='live'):
     now = now or datetime.now(TEHRAN)
-    eligible = [r for r in rows if fresh(r, now)]
+    if mode not in ('live', 'latest'):
+        raise DataError('REPORT_MODE باید live یا latest باشد.')
+    eligible = [r for r in rows if isinstance(r, dict) and fresh(r, now, mode)]
+    if eligible and mode == 'latest':
+        latest_day = max(int(r['dEven']) for r in eligible)
+        eligible = [r for r in eligible if int(r['dEven']) == latest_day]
     # Bounded API work: rank by traded value first, then fetch up to 40 histories.
     def value(row):
         try:
@@ -142,7 +160,7 @@ def scan(rows, history_loader, now=None):
     errors = []
     def one(row):
         try:
-            return evaluate(row, history_loader(row['insCode']), now)
+            return evaluate(row, history_loader(row['insCode']), now, mode)
         except (DataError, KeyError, ValueError):
             errors.append(1)
             return None
@@ -155,6 +173,9 @@ def format_report(results, checked, errors, demo=False, category=None):
     title = '🧪 دادهٔ ساختگی — فقط نمایش عملکرد' if demo else 'دیده‌بان پژوهشی معاملات روزانه'
     lines = [title, datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M تهران'),
              f'دامنه: حداکثر ۴۰ نماد پُرمعامله | بررسی: {checked} | خطای سابقه: {errors}']
+    if any(p.get('report_mode') == 'latest' for p in results):
+        lines.append('حالت آخرین جلسهٔ موجود: برای بررسی جلسه بعد؛ قیمت‌ها و سفارش‌ها قابل اتکای لحظه‌ای نیستند. '
+                     'در صورت تغییر وضعیت بازار، شرایط ورود باید دوباره بررسی شود.')
     for key, label in [('high', '۱) ریسک بالا / فرصت نوسان بیشتر'),
                        ('low', '۲) ریسک پایین‌تر / نوسان کمتر')]:
         if category and category != key:
@@ -162,12 +183,12 @@ def format_report(results, checked, errors, demo=False, category=None):
         lines.append('\n' + label)
         picks = [p for p in results if p['category'] == key][:5]
         if not picks:
-            lines.append('نامزد واجد شرایط با دادهٔ تازه یافت نشد.')
+            lines.append('نامزد واجد شرایط در دادهٔ قابل استفاده یافت نشد.')
         for p in picks:
             lines.append(f"• {p['symbol']} | آخرین: {p['last']:,.0f} ریال\n"
                          f"روند ۵جلسه‌ای: {p['momentum']:+.1%} | نوسان روزانه: {p['volatility']:.1%}\n"
                          f"حجم نسبت به میانگین روز کامل: {p['volume_ratio']:.2f} | فاصله خریدوفروش: {p['spread']:.2%}\n"
-                         f"ارزش معاملات: {p['value']/1e9:.1f} میلیارد ریال | ساعت داده: {p['timestamp']:06}")
+                         f"ارزش معاملات: {p['value']/1e9:.1f} میلیارد ریال | تاریخ داده: {p['date']} | ساعت: {p['timestamp']:06}")
             lines.append('دلیل تکنیکال: روند پنج‌جلسه‌ای مثبت و قیمت بالاتر از میانگین ۲۰جلسه است؛ '
                          'این یعنی جهت اخیر صعودی بوده، نه تضمین ادامهٔ صعود.\n'
                          'نقدشوندگی: ارزش معاملات و فاصلهٔ خریدوفروش از فیلتر عبور کرده‌اند؛ '
@@ -181,7 +202,8 @@ def format_report(results, checked, errors, demo=False, category=None):
                              f"کیفیت سود: جریان نقد عملیاتی/سود {f['cash_quality']:.2f}؛ نسبت بالاتر یعنی پشتوانه نقدی بیشتر سود.\n"
                              f"بدهی/حقوق صاحبان سهام {f['debt_equity']:.2f}؛ نسبت بالاتر یعنی اهرم بیشتر.\n"
                              f"P/E سهم {f['pe']:.1f} در برابر میانه هم‌گروه {f['peers_pe']:.1f}؛ ارزانی به‌تنهایی دلیل خرید نیست.\n"
-                             f"پایان دوره: {f['period_end']} | انتشار: {f['published_at']}\n{f['source_url']}")
+                             f"پایان دوره: {f['period_end']} | انتشار: {f['published_at']}\n"
+                             f"تاریخ داده ارزش‌گذاری: {f['valuation_date']}\n{f['source_url']}")
     lines.extend(['\nمنبع رتبه‌بندی: TSETMC؛ اطلاعیه‌های کدال با /codal نماد.',
                   'بورسیک و تیندکس هنوز متصل نیستند. تحلیل خودکار متن اطلاعیه انجام نمی‌شود.',
                   'رتبهٔ پژوهشی؛ سود روزانه یا هفتگی را پیش‌بینی یا تضمین نمی‌کند. '
@@ -244,7 +266,8 @@ class Bot:
         if not isinstance(records, dict) or records.get('schema_version') != 1 or not isinstance(records.get('symbols'), dict):
             raise DataError('قالب منبع بنیادی معتبر نیست؛ قرارداد fundamentals.example.json را بررسی کنید.')
         symbols = {normalize(key): value for key, value in records['symbols'].items()}
-        results, checked, errors = scan(market_watch(), daily_history)
+        results, checked, errors = scan(market_watch(), daily_history,
+                                       mode=os.environ.get('REPORT_MODE', 'latest'))
         combined = []
         missing = 0
         for pick in results:
@@ -269,7 +292,7 @@ class Bot:
         if normalize(text) in ('تحلیل', '/analysis'):
             return self.combined_analysis()
         if normalize(text) in ('قوانین', '/rules'):
-            return ('۱. فقط داده تازه و نماد نقدشونده با سفارش دوطرفه.\n'
+            return ('۱. آخرین جلسهٔ موجود با تاریخ روشن؛ داده بیش از هفت روز یا آینده حذف می‌شود.\n'
                     '۲. روند مثبت پنج جلسه و قیمت بالای میانگین ۲۰جلسه.\n'
                     '۳. بنیادی: رشد مثبت فروش و سود دوره مشابه، جریان نقد مثبت، اهرم و P/E کنترل‌شده.\n'
                     '۴. گروه آرام‌تر: نوسان ≤۲٪، بدهی/حقوق ≤۱، نقد عملیاتی/سود ≥۰٫۸ و P/E ≤هم‌گروه.\n'
@@ -281,10 +304,11 @@ class Bot:
         command = parts[0].split('@')[0] if parts else ''
         if command in ('/scan', '/high', '/low'):
             now = datetime.now(TEHRAN)
-            expired = self.cache and any(not fresh({'dEven': r['date'], 'hEven': r['timestamp']}, now)
+            mode = os.environ.get('REPORT_MODE', 'latest')
+            expired = self.cache and any(not fresh({'dEven': r['date'], 'hEven': r['timestamp']}, now, mode)
                                             for r in self.cache[0])
             if not self.cache or expired or time.monotonic() - self.cache_at > 60:
-                self.cache = scan(market_watch(), daily_history)
+                self.cache = scan(market_watch(), daily_history, mode=mode)
                 self.cache_at = time.monotonic()
             return format_report(*self.cache, category={'/high': 'high', '/low': 'low'}.get(command))
         if command == '/codal':
@@ -292,7 +316,8 @@ class Bot:
         if command == '/status':
             return ('TSETMC و کدال: اتصال هنگام درخواست؛ اعتبارسنجی زنده در این محیط هنوز انجام نشده.\n'
                     'بورسیک و تیندکس: آدرس مشخص؛ اتصال داده هنوز پیاده‌سازی نشده.\n'
-                    'اگر داده بیش از ۱۰ دقیقه قدیمی باشد نامزد جدید نمایش داده نمی‌شود.')
+                    'حالت پیش‌فرض: آخرین جلسه با تاریخ روشن، حداکثر هفت روز؛ دادهٔ زنده نیست.\n'
+                    'حالت live فقط داده حداکثر ده دقیقه قبل را می‌پذیرد.')
         if command == '/sources':
             return ('TSETMC: https://www.tsetmc.com/ — دریافت داده هنگام اسکن، اتصال زنده تأیید نشده\n'
                     'کدال: https://www.codal.ir/ — دریافت اطلاعیه با /codal، اتصال زنده تأیید نشده\n'
@@ -301,9 +326,18 @@ class Bot:
         return HELP
 
     def run(self, state_path):
+        if not self.allowed_chat and os.environ.get('BOT_PUBLIC', '').lower() != 'true':
+            raise DataError('برای بات خصوصی TELEGRAM_CHAT_ID لازم است؛ استفاده عمومی فقط با BOT_PUBLIC=true فعال می‌شود.')
         state_path.parent.mkdir(parents=True, exist_ok=True)
         offset = int(state_path.read_text()) if state_path.exists() else 0
-        self.api('getMe', {})  # Fail early on invalid credentials, without logging token.
+        # Connections may drop or change IP before startup as well as while polling.
+        while True:
+            try:
+                self.api('getMe', {})
+                break
+            except DataError:
+                print('Telegram unavailable. Check token/network; retrying in 10 seconds.', flush=True)
+                time.sleep(10)
         print('Bot started (long polling).', flush=True)
         while True:
             try:
@@ -313,7 +347,7 @@ class Bot:
                     chat_id = msg.get('chat', {}).get('id')
                     if chat_id is not None and (not self.allowed_chat or str(chat_id) == self.allowed_chat):
                         try:
-                            answer = self.answer(msg.get('text', ''))
+                            answer = self.answer(msg.get('text') or '')
                         except DataError as exc:
                             answer = str(exc) + '\nدادهٔ ساختگی جایگزین دادهٔ زنده نمی‌شود.'
                         for start in range(0, len(answer), 3500):
@@ -337,7 +371,8 @@ def main():
         rows, history, now = fixture()
         print(format_report(*scan(rows, lambda code: history[code], now), demo=True))
     elif args.scan:
-        print(format_report(*scan(market_watch(), daily_history)))
+        print(format_report(*scan(market_watch(), daily_history,
+                                 mode=os.environ.get('REPORT_MODE', 'latest'))))
     else:
         token = os.environ.get('TELEGRAM_BOT_TOKEN')
         if not token:
