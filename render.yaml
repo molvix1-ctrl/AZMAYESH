@@ -1,0 +1,15 @@
+# Background workers require a paid plan. Review current pricing before creating.
+services:
+  - type: worker
+    name: boorsemlvi-bot
+    runtime: python
+    plan: starter
+    buildCommand: python3 -m unittest -v
+    startCommand: python3 bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: FUNDAMENTALS_URL
+        sync: false
